@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reklaim Deck Builder</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0A0A0A; font-family: 'Calibri', Georgia, serif; color: #fff; }
+  @keyframes pulse {
+    0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1); }
+  }
+  textarea:focus { outline: none; border-color: #F5C518 !important; }
+  .example-btn:hover { border-color: #F5C518 !important; color: #F5C518 !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const SYSTEM_PROMPT = `You are the Reklaim Deck Builder AI. Your job is to take a sales rep's brief and generate a complete, valid deck_config.json for the Reklaim sales deck template.
+
+## Brief Classification
+First, classify the brief as one of:
+- **Routine**: standard brand + vertical pitch → generate config directly
+- **Custom**: specific structural deviation requested → adapt config accordingly
+- **Strategic**: unusual angle, exec-level, competitive challenge → propose 1-2 angles first, then build
+- **Ambiguous**: unclear brand/audience → ask 1-2 sharp questions
+
+## IMPORTANT: Slide Count Requests
+The template always produces 10 slides — this cannot be changed. If a brief asks for fewer slides (e.g. "3-4 slides", "short deck", "quick overview"), classify as Routine, build the full 10-slide deck, and add a note like: "Brief requested a shorter deck — the template produces a full 10-slide deck. Content has been tailored to their focus areas." Never fail or refuse because of a slide count request.
+
+## Output Format
+For Routine and Custom briefs, respond with ONLY a JSON object:
+{
+  "type": "config",
+  "classification": "Routine|Custom|Strategic",
+  "notes": "brief delivery note",
+  "config": { ...complete deck config... }
+}
+For Ambiguous or Strategic (pre-build):
+{
+  "type": "question",
+  "message": "your question or strategic proposal"
+}
+
+## Config Schema (all fields required)
+brand, year (2026), presenter ("Reklaim"), shortVertical (snake_case), deckTitle,
+coverHeadline: {line1, line2}, coverSubtitle,
+userJourney: 5x {title, body},
+catalogue: {title, intro, leftHeader, rightHeader, left: 5x{name,desc}, right: 5x{name,desc}},
+verticals: {title, intro, cards: 3x{tag,title,stat,statLabel,body,icon,accent:bool}},
+tier1: {title, intro, audiences: 4x{name,reach,desc,signals}},
+tier2: {title, stats: 3x{num,label}, blocks: 3x{tag,title,body,icon}},
+advantages: {title, intro, items: 4x{title,body,icon}},
+solution: {eyebrow, title, intro, footnote, steps: 4x{title,body,icon}},
+activation: {title, intro, channels: 6x{title,body,icon}},
+closing: {eyebrow, headline, subline},
+contact: {name, email, web}
+
+## Icons
+FaCar FaUsers FaShieldAlt FaCity FaBullseye FaCheckCircle FaLayerGroup FaSearch FaFilter FaPlug FaBolt FaBroadcastTower FaTv FaShareAlt FaIdCard FaLock FaDownload FaUserCheck FaDollarSign FaChartBar FaHandshake FaGlobe
+
+## Reklaim Positioning
+- Zero-party, permissioned — consumers opt in via Reklaim app
+- SPI compliant — ethnicity, health, political are self-declared, not modeled
+- Dual consent: app + publisher
+- userJourney is ALWAYS the same 5 Reklaim app steps
+- Voice: direct, data-forward, compliance-aware, confident`;
+
+const STAGES = { IDLE:"idle", THINKING:"thinking", CLARIFYING:"clarifying", BUILDING:"building", DONE:"done", ERROR:"error" };
+
+const ghost = { background:"transparent", color:"#8A8A8A", border:"1px solid #2a2a2a", borderRadius:"6px", padding:"14px 24px", fontSize:"13px", cursor:"pointer", fontFamily:"Arial,sans-serif" };
+
+function Dots() {
+  return <div style={{display:"flex",gap:"8px",justifyContent:"center"}}>
+    {[0,1,2].map(i=><div key={i} style={{width:"10px",height:"10px",background:"#F5C518",borderRadius:"50%",animation:`pulse 1.2s ease-in-out ${i*0.2}s infinite`}}/>)}
+  </div>;
+}
+
+function App() {
+  const [brief, setBrief] = React.useState("");
+  const [stage, setStage] = React.useState(STAGES.IDLE);
+  const [message, setMessage] = React.useState("");
+  const [clarifyReply, setClarifyReply] = React.useState("");
+  const [configPreview, setConfigPreview] = React.useState(null);
+  const [notes, setNotes] = React.useState("");
+  const [classification, setClassification] = React.useState("");
+  const [errorMsg, setErrorMsg] = React.useState("");
+  const [history, setHistory] = React.useState([]);
+  const cfgRef = React.useRef(null);
+
+  const callClaude = async (messages) => {
+    const res = await fetch('/claude', {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({ model:"claude-sonnet-4-5", max_tokens:4000, system:SYSTEM_PROMPT, messages }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(typeof data.error === 'string' ? data.error : data.error.message);
+    const text = data.content?.find(b=>b.type==="text")?.text || "";
+    return JSON.parse(text.replace(/^```json\s*/i,"").replace(/```\s*$/i,"").trim());
+  };
+
+  const validateConfig = (config) => {
+    const checks = [
+      config.userJourney, config.catalogue?.left, config.catalogue?.right,
+      config.verticals?.cards, config.tier1?.audiences, config.tier2?.stats,
+      config.tier2?.blocks, config.advantages?.items, config.solution?.steps, config.activation?.channels
+    ];
+    return checks.every(v => !v || Array.isArray(v));
+  };
+
+  const submit = async (briefText) => {
+    if (!briefText.trim()) return;
+    setStage(STAGES.THINKING); setErrorMsg("");
+    const cleanBrief = briefText.replace(/\b\d+[\-\u2013]\d+\s*slides?\b/gi, "").replace(/\bshort deck\b/gi, "").trim();
+    const messages = [...history, {role:"user",content:cleanBrief}];
+    try {
+      let result = await callClaude(messages);
+      if (result.type === "config" && !validateConfig(result.config)) {
+        const retryMessages = [...messages,
+          {role:"assistant", content:JSON.stringify(result)},
+          {role:"user", content:"IMPORTANT: Your response had objects where arrays were required. Regenerate ensuring userJourney, catalogue.left, catalogue.right, verticals.cards, tier1.audiences, tier2.stats, tier2.blocks, advantages.items, solution.steps, activation.channels are ALL proper JSON arrays using []."}
+        ];
+        result = await callClaude(retryMessages);
+      }
+      setHistory([...messages, {role:"assistant",content:JSON.stringify(result)}]);
+      if (result.type === "question") { setMessage(result.message); setStage(STAGES.CLARIFYING); }
+      else if (result.type === "config") {
+        cfgRef.current = result.config;
+        setConfigPreview(result.config); setNotes(result.notes||""); setClassification(result.classification||"");
+        setStage(STAGES.BUILDING);
+        await buildDeck(result.config);
+      }
+    } catch(err) { setErrorMsg("AI error: "+err.message); setStage(STAGES.ERROR); }
+  };
+
+  const buildDeck = async (config) => {
+    try {
+      const res = await fetch('/generate', { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({config}) });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.error||"Failed"); }
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `Reklaim_${(config.brand||"Deck").replace(/\s+/g,"_")}_${config.shortVertical||"Pitch"}.pptx`;
+      a.click();
+      setStage(STAGES.DONE);
+    } catch(err) { setErrorMsg("Deck error: "+err.message); setStage(STAGES.ERROR); }
+  };
+
+  const reset = () => { setBrief(""); setStage(STAGES.IDLE); setMessage(""); setClarifyReply(""); setConfigPreview(null); setNotes(""); setClassification(""); setErrorMsg(""); setHistory([]); cfgRef.current=null; };
+
+  const cc = {Routine:"#4ade80",Custom:"#facc15",Strategic:"#f97316"}[classification]||"#facc15";
+
+  return <div style={{minHeight:"100vh",background:"#0A0A0A",display:"flex",flexDirection:"column"}}>
+    <div style={{padding:"28px 40px 20px",borderBottom:"1px solid #1F1F1F",display:"flex",alignItems:"center",gap:"14px"}}>
+      <span style={{fontFamily:"'Arial Black',Arial,sans-serif",fontSize:"22px",fontWeight:900,color:"#F5C518",letterSpacing:"5px"}}>REKLAIM</span>
+      <div style={{width:"10px",height:"10px",background:"#F5C518",borderRadius:"2px"}}/>
+      <div style={{width:"1px",height:"28px",background:"#2a2a2a"}}/>
+      <span style={{color:"#8A8A8A",fontSize:"13px",letterSpacing:"3px",textTransform:"uppercase",fontFamily:"Arial"}}>Deck Builder</span>
+    </div>
+
+    <div style={{flex:1,maxWidth:"780px",margin:"0 auto",padding:"60px 40px",width:"100%"}}>
+
+      {stage===STAGES.IDLE && <div>
+        <div style={{marginBottom:"48px"}}>
+          <h1 style={{fontSize:"42px",fontWeight:700,margin:"0 0 16px",lineHeight:1.1}}>Build a deck.<br/><span style={{color:"#F5C518"}}>In seconds.</span></h1>
+          <p style={{color:"#8A8A8A",fontSize:"16px",lineHeight:1.6}}>Paste your brief — brand, vertical, deal context, notes. Claude generates the config and builds the PPTX.</p>
+        </div>
+        <label style={{display:"block",color:"#8A8A8A",fontSize:"11px",letterSpacing:"3px",textTransform:"uppercase",fontFamily:"Arial",marginBottom:"10px"}}>Your Brief</label>
+        <textarea value={brief} onChange={e=>setBrief(e.target.value)}
+          placeholder={"Example:\n\nBuilding a deck for Toyota. Tier 2, multicultural — Hispanic and Asian American SUV buyers in LA and Houston. Meeting Tuesday, lead with compliance story, close with CPL solution. Neil presenting."}
+          style={{width:"100%",minHeight:"200px",background:"#111",border:"1px solid #2a2a2a",borderRadius:"8px",color:"#fff",fontSize:"15px",padding:"18px 20px",resize:"vertical",fontFamily:"inherit",lineHeight:1.6,marginBottom:"12px"}}/>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{display:"flex",gap:"8px",flexWrap:"wrap"}}>
+            {["Toyota, Tier 2 multicultural auto","Healthcare, multicultural patients","Political, Hispanic voter outreach"].map((ex,i)=>
+              <button key={i} className="example-btn" onClick={()=>setBrief(ex)} style={{background:"transparent",border:"1px solid #2a2a2a",color:"#8A8A8A",borderRadius:"20px",padding:"6px 14px",fontSize:"12px",cursor:"pointer",fontFamily:"inherit",transition:"all 0.2s"}}>{ex}</button>
+            )}
+          </div>
+          <button onClick={()=>submit(brief)} disabled={!brief.trim()} style={{background:brief.trim()?"#F5C518":"#2a2a2a",color:brief.trim()?"#0A0A0A":"#555",border:"none",borderRadius:"6px",padding:"14px 32px",fontSize:"14px",fontWeight:700,letterSpacing:"2px",textTransform:"uppercase",cursor:brief.trim()?"pointer":"not-allowed",fontFamily:"Arial",whiteSpace:"nowrap"}}>Build Deck →</button>
+        </div>
+      </div>}
+
+      {stage===STAGES.THINKING && <div style={{textAlign:"center",paddingTop:"80px"}}><Dots/><p style={{color:"#8A8A8A",fontSize:"15px",marginTop:"32px"}}>Classifying brief and generating config…</p></div>}
+
+      {stage===STAGES.CLARIFYING && <div>
+        <div style={{background:"#111",border:"1px solid #F5C518",borderRadius:"8px",padding:"24px 28px",marginBottom:"24px"}}>
+          <p style={{color:"#F5C518",fontSize:"11px",letterSpacing:"3px",textTransform:"uppercase",fontFamily:"Arial",marginBottom:"12px"}}>Need clarification</p>
+          <p style={{color:"#fff",fontSize:"16px",lineHeight:1.6}}>{message}</p>
+        </div>
+        <textarea value={clarifyReply} onChange={e=>setClarifyReply(e.target.value)} placeholder="Your answer…"
+          style={{width:"100%",minHeight:"120px",background:"#111",border:"1px solid #2a2a2a",borderRadius:"8px",color:"#fff",fontSize:"15px",padding:"16px 20px",resize:"vertical",fontFamily:"inherit",lineHeight:1.6,marginBottom:"12px"}}/>
+        <div style={{display:"flex",justifyContent:"space-between"}}>
+          <button onClick={reset} style={ghost}>← Start over</button>
+          <button onClick={()=>{const c=`${brief}\n\nAdditional context: ${clarifyReply}`;setClarifyReply("");setHistory([]);submit(c);}} disabled={!clarifyReply.trim()}
+            style={{background:clarifyReply.trim()?"#F5C518":"#2a2a2a",color:clarifyReply.trim()?"#0A0A0A":"#555",border:"none",borderRadius:"6px",padding:"12px 28px",fontSize:"13px",fontWeight:700,letterSpacing:"2px",textTransform:"uppercase",cursor:clarifyReply.trim()?"pointer":"not-allowed",fontFamily:"Arial"}}>Continue →</button>
+        </div>
+      </div>}
+
+      {stage===STAGES.BUILDING && <div style={{textAlign:"center",paddingTop:"60px"}}><Dots/><p style={{color:"#8A8A8A",fontSize:"15px",marginTop:"32px"}}>{classification&&<span style={{color:cc,fontWeight:700}}>{classification} brief · </span>}Rendering 10 slides…</p></div>}
+
+      {stage===STAGES.DONE && <div>
+        <div style={{background:"#0d1f0d",border:"1px solid #2d5a2d",borderRadius:"8px",padding:"28px 32px",marginBottom:"32px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:"12px",marginBottom:"16px"}}>
+            <div style={{width:"10px",height:"10px",background:"#4ade80",borderRadius:"50%"}}/>
+            <span style={{color:"#4ade80",fontSize:"11px",letterSpacing:"3px",textTransform:"uppercase",fontFamily:"Arial",fontWeight:700}}>Deck downloaded</span>
+            {classification&&<span style={{background:"#1a1a1a",color:cc,fontSize:"10px",letterSpacing:"2px",padding:"3px 10px",borderRadius:"12px",fontFamily:"Arial",textTransform:"uppercase"}}>{classification}</span>}
+          </div>
+          {notes&&<p style={{color:"#8A8A8A",fontSize:"14px",marginBottom:"16px",lineHeight:1.6}}><span style={{color:"#F5C518"}}>Note: </span>{notes}</p>}
+          <p style={{color:"#555",fontSize:"13px"}}>{configPreview?.brand} · {configPreview?.shortVertical?.replace(/_/g," ")} · 10 slides</p>
+        </div>
+        <div style={{display:"flex",gap:"12px"}}>
+          <button onClick={reset} style={{background:"#F5C518",color:"#0A0A0A",border:"none",borderRadius:"6px",padding:"14px 32px",fontSize:"14px",fontWeight:700,letterSpacing:"2px",textTransform:"uppercase",cursor:"pointer",fontFamily:"Arial"}}>Build another →</button>
+          <button onClick={()=>buildDeck(cfgRef.current)} style={ghost}>Re-download</button>
+        </div>
+      </div>}
+
+      {stage===STAGES.ERROR && <div>
+        <div style={{background:"#1f0d0d",border:"1px solid #5a2d2d",borderRadius:"8px",padding:"24px 28px",marginBottom:"24px"}}>
+          <p style={{color:"#f87171",fontSize:"13px",letterSpacing:"2px",textTransform:"uppercase",fontFamily:"Arial",marginBottom:"10px"}}>Error</p>
+          <p style={{color:"#fff",fontSize:"14px",lineHeight:1.6}}>{errorMsg}</p>
+        </div>
+        <button onClick={reset} style={ghost}>← Try again</button>
+      </div>}
+
+    </div>
+
+    <div style={{padding:"16px 40px",borderTop:"1px solid #111",display:"flex",justifyContent:"space-between"}}>
+      <span style={{color:"#333",fontSize:"11px",fontFamily:"Arial"}}>REKLAIM · CONFIDENTIAL</span>
+      <span style={{color:"#333",fontSize:"11px",fontFamily:"Arial"}}>neil@reklaimyours.com</span>
+    </div>
+  </div>;
+}
+
+ReactDOM.render(<App/>, document.getElementById("root"));
+</script>
+</body>
+</html>
